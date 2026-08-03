@@ -1,0 +1,23 @@
+# syntax=docker/dockerfile:1.7
+# buzz-control-plane image — builds the workspace crate that implements the
+# self-serve + Builderlab-compatible hosted API (crates/buzz-control-plane).
+# Build context must be the REPO ROOT (workspace members are path deps):
+#   docker build -f deploy/Dockerfile.control-plane -t buzz-control-plane:local .
+
+ARG RUST_VERSION=1.95
+ARG DEBIAN_VERSION=bookworm
+
+FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+COPY examples ./examples
+# 其余 workspace 成员若构建报缺失，按 Cargo.toml members 列表补充
+RUN cargo build --release -p buzz-control-plane
+
+FROM debian:${DEBIAN_VERSION}-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/buzz-control-plane /usr/local/bin/buzz-control-plane
+ENTRYPOINT ["buzz-control-plane"]

@@ -1,0 +1,29 @@
+# Buzz 生产路由 —— 纯 HTTP（TLS 在 LB 终结，Caddy 不持有证书）
+#
+# 架构：
+#   客户端 ──HTTPS──> LB(终结 TLS, 泛域名证书在 LB) ──HTTP──> k3s-root:80 (本文件) ──> 后端容器
+#
+# 注意：不要在这里配 :80 裸站点加自动 HTTPS 跳转 —— 客户端到 LB 已经是 HTTPS，
+# 如果 Caddy 再回 301 会造成死循环。Caddy 只按 Host 头路由。
+
+http://sso.robogo-fat2.d-robotics.cc {
+	reverse_proxy casdoor:8000
+}
+
+http://api.robogo-fat2.d-robotics.cc {
+	reverse_proxy control-plane:8900
+}
+
+http://dl.robogo-fat2.d-robotics.cc {
+	root * /srv/downloads
+	file_server
+}
+
+http://*.robogo-fat2.d-robotics.cc {
+	reverse_proxy relay:3000
+}
+
+# 兜底：未知 Host（如 LB 健康检查不带 Host、IP 直连）一律返回 200，确保健康检查通过
+:80 {
+	respond 200
+}

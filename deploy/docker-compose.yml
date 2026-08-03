@@ -1,0 +1,146 @@
+name: buzz
+
+# Buzz 生产栈 —— k3s-root (114.111.19.49)
+# 唯一对宿主发布的端口是 Caddy 的 80/443；其余全部在内部网络 buzz-net。
+# LB 只需要 TCP 透传到本机的 80/443（见 deploy/README.md）。
+
+services:
+  caddy:
+    image: docker.io/library/caddy:2
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./downloads:/srv/downloads:ro
+      - caddy-data:/data
+    extra_hosts:   # 共享机上 docker DNS(127.0.0.11) 会抖动，静态解析兜底
+      - "relay:10.213.99.11"
+      - "control-plane:10.213.99.12"
+      - "casdoor:10.213.99.13"
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.10
+
+  relay:
+    image: buzz-relay:local   # 本仓库源码构建：含 archive 端点 + replay GET 修复；官方镜像 ghcr.io/block/buzz:latest 缺这些
+    restart: unless-stopped
+    env_file: relay.env
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis: {condition: service_started}
+      minio-init: {condition: service_completed_successfully}
+    extra_hosts:
+      - "postgres:10.213.99.20"
+      - "redis:10.213.99.21"
+      - "minio:10.213.99.22"
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.11
+
+  control-plane:
+    image: buzz-control-plane:local
+    restart: unless-stopped
+    command:
+      - serve
+      - --origin=http://relay:3000
+      - --public-origin=https://api.robogo-fat2.d-robotics.cc
+      - --host-suffix=.robogo-fat2.d-robotics.cc
+      - --listen=0.0.0.0:8900
+      - --data-dir=/data
+      - --require-sso
+      - --casdoor-endpoint=https://sso.robogo-fat2.d-robotics.cc
+      - --casdoor-client-id=${CASDOOR_CLIENT_ID}
+      - --casdoor-client-secret=${CASDOOR_CLIENT_SECRET}
+      - --rate-create-max=10
+      - --key-source=file:/secrets/operator-key
+    volumes:
+      - cp-data:/data
+      - ./secrets:/secrets:ro
+    depends_on:
+      relay: {condition: service_started}
+      casdoor: {condition: service_started}
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.12
+
+  casdoor:
+    image: docker.io/casbin/casdoor:latest
+    restart: unless-stopped
+    volumes:
+      - ./casdoor/app.conf:/conf/app.conf:ro
+    depends_on:
+      postgres: {condition: service_healthy}
+    extra_hosts:
+      - "postgres:10.213.99.20"
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.13
+
+  postgres:
+    image: docker.m.daocloud.io/library/postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: buzz
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: buzz
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+      - ./postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U buzz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.20
+
+  redis:
+    image: docker.m.daocloud.io/library/redis:7-alpine
+    restart: unless-stopped
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.21
+
+  minio:
+    image: docker.m.daocloud.io/minio/minio:latest
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: buzz_dev
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio-data:/data
+    networks:
+      buzz-net:
+        ipv4_address: 10.213.99.22
+
+  minio-init:
+    image: quay.io/minio/mc:latest
+    depends_on:
+      minio: {condition: service_started}
+    entrypoint: >
+      /bin/sh -c "
+      for i in $$(seq 1 30); do
+        mc alias set local http://minio:9000 buzz_dev $${MINIO_ROOT_PASSWORD} && break || sleep 2;
+      done;
+      mc mb -p local/buzz-media || true;
+      mc anonymous set download local/buzz-media || true;
+      "
+    environment:
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    networks: [buzz-net]
+
+networks:
+  buzz-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.213.99.0/24
+
+volumes:
+  caddy-data:
+  pg-data:
+  minio-data:
+  cp-data:
