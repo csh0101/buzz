@@ -265,6 +265,67 @@ fn keyring_entry(service: &str, key: &str) -> Result<keyring::Entry, keyring::Er
     keyring::Entry::new(service, key)
 }
 
+// ── Dev-only file override ────────────────────────────────────────────────
+//
+// Unsigned dev builds (`tauri dev`) are ad-hoc signed, so every rebuild
+// changes the binary's cdhash and macOS treats the next keychain access as a
+// *different app* — re-prompting for the blob item on every rebuild. Setting
+// `BUZZ_SECRET_STORE_FILE=/path/to/file.json` moves the blob to a plaintext
+// `0o600` JSON file instead, eliminating all blob keychain prompts. The file
+// maps service name -> blob JSON string so multiple services can share it.
+//
+// Dev-only escape hatch — never set this in release builds. Plaintext secrets
+// match the existing threat model: callers already fall back to `0o600` file
+// storage when the system-keyring feature is compiled out.
+#[cfg(feature = "system-keyring")]
+fn dev_file_override() -> Option<PathBuf> {
+    std::env::var("BUZZ_SECRET_STORE_FILE")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Read the blob for `service` from the override file. `Ok(None)` when the
+/// file or the service entry does not exist yet.
+#[cfg(feature = "system-keyring")]
+fn dev_file_read(path: &std::path::Path, service: &str) -> Result<Option<Vec<u8>>, String> {
+    let raw = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("dev secret file read {}: {e}", path.display())),
+    };
+    let map = serde_json::from_str::<HashMap<String, String>>(&raw)
+        .map_err(|e| format!("dev secret file json: {e}"))?;
+    Ok(map.get(service).map(|s| s.clone().into_bytes()))
+}
+
+/// Write the blob for `service` into the override file with `0o600` perms.
+#[cfg(feature = "system-keyring")]
+fn dev_file_write(path: &std::path::Path, service: &str, bytes: &[u8]) -> Result<(), String> {
+    let value = std::str::from_utf8(bytes).map_err(|e| format!("dev secret blob utf8: {e}"))?;
+    let mut map = match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str::<HashMap<String, String>>(&raw)
+            .map_err(|e| format!("dev secret file json: {e}"))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(e) => return Err(format!("dev secret file read {}: {e}", path.display())),
+    };
+    map.insert(service.to_string(), value.to_string());
+    let json =
+        serde_json::to_string(&map).map_err(|e| format!("dev secret file serialize: {e}"))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("dev secret file mkdir {}: {e}", parent.display()))?;
+    }
+    std::fs::write(path, json).map_err(|e| format!("dev secret file write: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("dev secret file chmod: {e}"))?;
+    }
+    Ok(())
+}
+
 // macOS-specific imports for the Data Protection Keychain backend.
 #[cfg(all(feature = "system-keyring", target_os = "macos"))]
 use security_framework::base::Error as SFError;
@@ -353,6 +414,9 @@ impl SecretStore {
     /// builds that lack hardened-runtime entitlements).
     #[cfg(feature = "system-keyring")]
     fn read_blob_raw_keyring(&self) -> Result<Option<Vec<u8>>, String> {
+        if let Some(path) = dev_file_override() {
+            return dev_file_read(&path, &self.service);
+        }
         let entry =
             keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;
         match entry.get_password() {
@@ -464,6 +528,9 @@ impl SecretStore {
 
     #[cfg(feature = "system-keyring")]
     fn write_blob_raw_keyring(&self, bytes: &[u8]) -> Result<(), String> {
+        if let Some(path) = dev_file_override() {
+            return dev_file_write(&path, &self.service, bytes);
+        }
         let value = std::str::from_utf8(bytes).map_err(|e| format!("blob utf8 encode: {e}"))?;
         let entry =
             keyring_entry(&self.service, BLOB_KEY).map_err(|e| format!("keyring entry: {e}"))?;

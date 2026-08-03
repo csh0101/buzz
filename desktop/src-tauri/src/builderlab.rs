@@ -12,7 +12,9 @@ use tauri_plugin_opener::OpenerExt;
 use tokio::{net::TcpListener, sync::oneshot};
 use url::Url;
 
-const BUILDERLAB_API_BASE_URL: &str = "https://app.builderlab.xyz/api/goose";
+// 二开部署：默认指向自建控制面（k3s-root 上的 buzz-control-plane serve）。
+// 运行时仍可用 BUZZ_HOSTED_API_BASE_URL 覆盖（本地开发指回 localhost:8900）。
+const BUILDERLAB_API_BASE_URL: &str = "https://api.robogo-fat2.d-robotics.cc/api/goose";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const BB_SESSION_CREDENTIAL_HEADER: &str = "X-BB-Session-Credential";
 // Builderlab enforces an Origin check on the identity bind endpoints. Browsers
@@ -209,9 +211,24 @@ async fn login_callback(
     Html(AUTH_COMPLETE_HTML).into_response()
 }
 
-fn api_url(path: &str) -> Result<Url, String> {
-    Url::parse(&format!("{BUILDERLAB_API_BASE_URL}{path}"))
+/// Base URL for the hosted-community control plane. Defaults to Block's
+/// hosted Builderlab; self-hosted deployments point the desktop at their own
+/// control plane by setting BUZZ_HOSTED_API_BASE_URL (e.g. in .env for
+/// `just dev`).
+fn api_base_url() -> String {
+    std::env::var("BUZZ_HOSTED_API_BASE_URL")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| BUILDERLAB_API_BASE_URL.to_owned())
+}
+
+fn api_url_with_base(base: &str, path: &str) -> Result<Url, String> {
+    Url::parse(&format!("{base}{path}"))
         .map_err(|error| format!("invalid Builderlab API URL: {error}"))
+}
+
+fn api_url(path: &str) -> Result<Url, String> {
+    api_url_with_base(&api_base_url(), path)
 }
 
 fn login_url(return_to: &str) -> Result<Url, String> {
@@ -663,7 +680,7 @@ mod tests {
 
     #[test]
     fn api_paths_stay_on_builderlab_api_origin() {
-        let login = api_url("/v1/auth/login").unwrap();
+        let login = api_url_with_base(BUILDERLAB_API_BASE_URL, "/v1/auth/login").unwrap();
         assert_eq!(
             login.origin().ascii_serialization(),
             "https://app.builderlab.xyz"
