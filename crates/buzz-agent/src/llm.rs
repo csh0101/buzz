@@ -1706,6 +1706,96 @@ fn is_retryable_transport_error(e: &reqwest::Error) -> bool {
     e.is_timeout() || e.is_connect() || e.is_request()
 }
 
+/// How long an in-flight LLM request may go unanswered before the endpoint
+/// liveness probe arms. This is **not** a request timeout — non-streaming
+/// completions can legitimately take minutes while the model thinks, and
+/// they keep waiting as long as the probe says the route is alive. Override
+/// with `BUZZ_AGENT_LLM_STALL_PROBE_SECS` (default 30s).
+fn stall_probe_after() -> std::time::Duration {
+    std::env::var("BUZZ_AGENT_LLM_STALL_PROBE_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(std::time::Duration::from_secs(30))
+}
+
+/// Cheap liveness probe for the LLM endpoint: `GET` the same URL the
+/// completion `POST` targets, with a short total timeout. Any HTTP-level
+/// response — even 401/404/405 — proves the route is alive and the stalled
+/// request is merely waiting on a slow model; a timeout or connect error
+/// means the route is black-holed (e.g. a proxy/VPN silently swallowing
+/// packets), which the read timeout would otherwise take minutes to detect.
+async fn endpoint_alive<F>(
+    http: &Client,
+    url: &str,
+    apply: &F,
+    probe_timeout: std::time::Duration,
+) -> bool
+where
+    F: Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+{
+    match apply(http.get(url)).timeout(probe_timeout).send().await {
+        Ok(_) => true,
+        Err(e) if e.is_timeout() || e.is_connect() => false,
+        // Decode/redirect/HTTP errors still mean the server talked back.
+        Err(_) => true,
+    }
+}
+
+/// Outcome of a stall-supervised request send.
+enum SendOutcome {
+    /// The request completed at the HTTP level (any status).
+    Response(reqwest::Response),
+    /// The request failed with a transport error of its own.
+    Transport(reqwest::Error),
+    /// The request stalled past the probe window while the endpoint was
+    /// unreachable — the route is black-holed, so the stalled request was
+    /// aborted instead of riding out the full read timeout.
+    DeadRoute,
+}
+
+/// Drive `send` to completion while watching for black-holed routes.
+///
+/// Non-streaming completions can legitimately take minutes, so a short
+/// request timeout is not viable. Instead, whenever the in-flight request
+/// goes `stall_after` without completing, the endpoint is probed (see
+/// [`endpoint_alive`]): if the probe succeeds the model is just slow and
+/// waiting continues; if it fails the route is dead and the stalled request
+/// is aborted as [`SendOutcome::DeadRoute`], letting the retry loop react
+/// within seconds instead of minutes.
+async fn send_with_stall_probe<F, Fut>(
+    http: &Client,
+    url: &str,
+    apply: &F,
+    send: Fut,
+    stall_after: std::time::Duration,
+    probe_timeout: std::time::Duration,
+) -> SendOutcome
+where
+    F: Fn(reqwest::RequestBuilder) -> reqwest::RequestBuilder,
+    Fut: std::future::Future<Output = Result<reqwest::Response, reqwest::Error>>,
+{
+    tokio::pin!(send);
+    loop {
+        match tokio::time::timeout(stall_after, &mut send).await {
+            Ok(Ok(resp)) => return SendOutcome::Response(resp),
+            Ok(Err(e)) => return SendOutcome::Transport(e),
+            Err(_elapsed) => {
+                if endpoint_alive(http, url, apply, probe_timeout).await {
+                    continue;
+                }
+                tracing::warn!(
+                    stalled_for = ?stall_after,
+                    "llm: request stalled and endpoint probe failed — aborting \
+                     stalled request (route black-hole suspected)"
+                );
+                return SendOutcome::DeadRoute;
+            }
+        }
+    }
+}
+
 /// Build the terminal `AgentError::Llm` for a `post()` exit that has given up
 /// retrying — persistent retryable status, transport failure, or a body-read
 /// break. `detail` carries the specific cause (status/body, or the transport
@@ -1795,16 +1885,24 @@ where
         .map_err(|e| PostError::Agent(AgentError::Llm(format!("serialize: {e}"))))?;
     let call_start = std::time::Instant::now();
     for attempt in 0..MAX_RETRIES {
-        let resp = match apply(
+        let send = apply(
             http.post(url)
                 .header("content-type", "application/json")
                 .body(body_bytes.clone()),
         )
-        .send()
+        .send();
+        let resp = match send_with_stall_probe(
+            http,
+            url,
+            &apply,
+            send,
+            stall_probe_after(),
+            std::time::Duration::from_secs(10),
+        )
         .await
         {
-            Ok(r) => r,
-            Err(e) => {
+            SendOutcome::Response(r) => r,
+            SendOutcome::Transport(e) => {
                 if attempt + 1 < MAX_RETRIES && is_retryable_transport_error(&e) {
                     tracing::warn!(
                         attempt = attempt + 1,
@@ -1819,6 +1917,25 @@ where
                     call_start.elapsed(),
                     attempt + 1,
                     &format!("transport: {e}"),
+                )));
+            }
+            SendOutcome::DeadRoute => {
+                let detail = "transport: request stalled with unreachable endpoint \
+                              (route black-hole); aborted";
+                if attempt + 1 < MAX_RETRIES {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        max_attempts = MAX_RETRIES,
+                        error = %detail,
+                        "llm: transport error, retrying"
+                    );
+                    backoff_with_jitter(attempt).await;
+                    continue;
+                }
+                return Err(PostError::Agent(terminal_llm_error(
+                    call_start.elapsed(),
+                    attempt + 1,
+                    detail,
                 )));
             }
         };
@@ -2501,6 +2618,153 @@ mod tests {
             }
         });
         (base_url, captured)
+    }
+
+    /// A TCP listener that accepts connections and holds them open without
+    /// ever responding — simulates a black-holed route where packets are
+    /// silently swallowed.
+    async fn spawn_black_hole() -> String {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                match listener.accept().await {
+                    Ok((socket, _)) => held.push(socket), // hold open, never answer
+                    Err(_) => return,
+                }
+            }
+        });
+        base_url
+    }
+
+    /// A stub that answers `GET` probes instantly with 405 and delays `POST`
+    /// responses by `post_delay` — simulates a slow-but-alive model endpoint.
+    async fn spawn_slow_alive_stub(post_delay: Duration, body: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(_) => return,
+                };
+                tokio::spawn(async move {
+                    let mut bytes = vec![0u8; 1024];
+                    let read = match socket.read(&mut bytes).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => read,
+                    };
+                    let header = String::from_utf8_lossy(&bytes[..read]).into_owned();
+                    let is_get = header.starts_with("GET ");
+                    if !is_get {
+                        tokio::time::sleep(post_delay).await;
+                    }
+                    let (status, status_text, payload) = if is_get {
+                        (405, "Method Not Allowed", "{}")
+                    } else {
+                        (200, "OK", body)
+                    };
+                    let wire = format!(
+                        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        status,
+                        status_text,
+                        payload.len(),
+                        payload,
+                    );
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+        base_url
+    }
+
+    #[tokio::test]
+    async fn stall_probe_aborts_black_holed_request() {
+        let base_url = spawn_black_hole().await;
+        let url = format!("{base_url}/chat/completions");
+        let http = Client::builder().build().unwrap();
+        let started = std::time::Instant::now();
+        let outcome = send_with_stall_probe(
+            &http,
+            &url,
+            &|rb: reqwest::RequestBuilder| rb,
+            http.post(&url).body("{}").send(),
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(
+            matches!(outcome, SendOutcome::DeadRoute),
+            "stalled request with unreachable endpoint must abort as DeadRoute"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "stall detection must bound the wait to ~stall+probe, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn stall_probe_tolerates_slow_but_alive_endpoint() {
+        let base_url = spawn_slow_alive_stub(Duration::from_millis(1200), "{\"ok\":true}").await;
+        let url = format!("{base_url}/chat/completions");
+        let http = Client::builder().build().unwrap();
+        let outcome = send_with_stall_probe(
+            &http,
+            &url,
+            &|rb: reqwest::RequestBuilder| rb,
+            http.post(&url).body("{}").send(),
+            Duration::from_millis(200),
+            Duration::from_millis(500),
+        )
+        .await;
+        match outcome {
+            SendOutcome::Response(resp) => assert_eq!(resp.status().as_u16(), 200),
+            _ => panic!("slow-but-alive endpoint must complete, not abort"),
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_alive_treats_any_http_status_as_alive() {
+        let base_url = spawn_slow_alive_stub(Duration::ZERO, "{}").await;
+        let http = Client::builder().build().unwrap();
+        assert!(
+            endpoint_alive(
+                &http,
+                &format!("{base_url}/chat/completions"),
+                &|rb: reqwest::RequestBuilder| rb,
+                Duration::from_millis(500),
+            )
+            .await,
+            "405 (or any HTTP status) must count as alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_alive_returns_false_for_refused_connection() {
+        // Bind a port and immediately release it so connects are refused.
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let http = Client::builder().build().unwrap();
+        assert!(
+            !endpoint_alive(
+                &http,
+                &format!("http://127.0.0.1:{port}/v1/chat/completions"),
+                &|rb: reqwest::RequestBuilder| rb,
+                Duration::from_millis(500),
+            )
+            .await,
+            "refused connection must count as dead"
+        );
     }
 
     fn model_catalog(ids: &[&str]) -> Value {
