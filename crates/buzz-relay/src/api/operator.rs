@@ -83,7 +83,13 @@ async fn authorize_operator_request(
         true, // operator endpoints always require NIP-98; no X-Pubkey dev fallback
         body.is_some(),
     )?;
-    check_operator_replay(state, event_id_bytes).await?;
+    // Replay-gate mutating calls only. NIP-98 event IDs have second-resolution
+    // `created_at` and no nonce, so two identical read-only GETs within one
+    // second collide on event ID and would be falsely rejected as replays —
+    // and replaying a GET is harmless anyway.
+    if method != "GET" {
+        check_operator_replay(state, event_id_bytes).await?;
+    }
 
     let pubkey_hex = pubkey.to_hex();
     if !state
