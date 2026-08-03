@@ -74,6 +74,11 @@ services:
     restart: unless-stopped
 
   keycloak:
+    # Demo-only OIDC provider — not needed for normal relay/desktop dev
+    # (SSO in our deployment is Casdoor). Its 1g limit makes the JVM
+    # OOM-loop on constrained machines, so it is opt-in:
+    #   docker compose --profile oidc up -d keycloak
+    profiles: ["oidc"]
     image: quay.io/keycloak/keycloak:26.0
     container_name: buzz-keycloak
     command: start-dev --http-port=8080
@@ -94,7 +99,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512m
+          memory: 1g
     labels:
       com.buzz.service: "keycloak"
       com.buzz.env: "dev"
